@@ -26,6 +26,7 @@ import (
 
 	"github.com/cenkalti/backoff/v5"
 	"github.com/theupdateframework/go-tuf/v2/metadata/fetcher"
+	"github.com/theupdateframework/go-tuf/v2/metadata/freshness"
 )
 
 type UpdaterConfig struct {
@@ -45,6 +46,9 @@ type UpdaterConfig struct {
 	RemoteTargetsURL      string
 	DisableLocalCache     bool
 	PrefixTargetsWithHash bool
+	// Freshness is an optional persistent audit ledger. A nil ledger disables
+	// all freshness record points without changing updater behavior.
+	Freshness *freshness.Ledger
 	// UnsafeLocalMode only uses the metadata as written on disk
 	// if the metadata is incomplete, calling updater.Refresh will fail
 	UnsafeLocalMode bool

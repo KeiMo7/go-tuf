@@ -34,6 +34,7 @@ import (
 
 	"github.com/theupdateframework/go-tuf/v2/metadata"
 	"github.com/theupdateframework/go-tuf/v2/metadata/config"
+	"github.com/theupdateframework/go-tuf/v2/metadata/freshness"
 	"github.com/theupdateframework/go-tuf/v2/metadata/trustedmetadata"
 )
 
@@ -135,10 +136,14 @@ func New(config *config.UpdaterConfig) (*Updater, error) {
 // the cached files on disk are used. If the cached data is not complete,
 // this call will fail.
 func (update *Updater) Refresh() error {
+	var refreshErr error
 	if update.cfg.UnsafeLocalMode {
-		return update.unsafeLocalRefresh()
+		refreshErr = update.unsafeLocalRefresh()
+	} else {
+		refreshErr = update.onlineRefresh()
 	}
-	return update.onlineRefresh()
+	update.flushFreshnessLedger()
+	return refreshErr
 }
 
 // onlineRefresh implements the TUF client workflow as described for
@@ -343,7 +348,9 @@ func (update *Updater) loadTimestamp() error {
 		return err
 	}
 	// try to verify and load the newly downloaded timestamp
+	beforeTimestampVersion := trustedRoleVersion(update.trusted, metadata.TIMESTAMP)
 	_, err = update.trusted.UpdateTimestamp(data)
+	update.recordTimestampFreshness(data, beforeTimestampVersion, err)
 	if err != nil {
 		if errors.Is(err, &metadata.ErrEqualVersionNumber{}) {
 			// if the new timestamp version is the same as current, discard the
@@ -414,7 +421,9 @@ func (update *Updater) loadSnapshot() error {
 		return err
 	}
 	// verify and load the new snapshot
+	beforeSnapshotVersion := trustedRoleVersion(update.trusted, metadata.SNAPSHOT)
 	_, err = update.trusted.UpdateSnapshot(data, false)
+	update.auditFreshness(metadata.SNAPSHOT, "", data, beforeSnapshotVersion, err)
 	if err != nil {
 		return err
 	}
@@ -475,8 +484,12 @@ func (update *Updater) loadTargets(roleName, parentName string) (*metadata.Metad
 	log := metadata.GetLogger()
 	// avoid loading "roleName" more than once during "GetTargetInfo", as
 	// long as the trusted copy is verified by "parentName"
+	_, verifiedPairBefore := update.verified[roleParentTuple{Role: roleName, Parent: parentName}]
 	role, ok := update.cachedTargets(roleName, parentName)
 	if ok {
+		if !verifiedPairBefore {
+			update.auditCachedTargetsFreshness(roleName, parentName, role)
+		}
 		return role, nil
 	}
 	// try to read local targets
@@ -529,7 +542,9 @@ func (update *Updater) loadTargets(roleName, parentName string) (*metadata.Metad
 		return nil, err
 	}
 	// verify and load the new target metadata
+	beforeTargetsVersion := trustedRoleVersion(update.trusted, roleName)
 	delegatedTargets, err := update.trusted.UpdateDelegatedTargets(data, roleName, parentName)
+	update.auditFreshness(roleName, parentName, data, beforeTargetsVersion, err)
 	if err != nil {
 		return nil, err
 	}
@@ -568,7 +583,10 @@ func (update *Updater) loadRoot() error {
 			return err
 		} else {
 			// downloading root metadata succeeded, so let's try to verify and load it
+			beforeRootVersion := trustedRoleVersion(update.trusted, metadata.ROOT)
 			_, err = update.trusted.UpdateRoot(data)
+			update.auditFreshness(metadata.ROOT, "", data, beforeRootVersion, err)
+			update.recordRootTrustReset(beforeRootVersion, err)
 			if err != nil {
 				return err
 			}
@@ -779,6 +797,182 @@ func (update *Updater) GetTrustedMetadataSet() trustedmetadata.TrustedMetadata {
 // Using this function is useful when testing time-related behavior in go-tuf.
 func (update *Updater) UnsafeSetRefTime(t time.Time) {
 	update.trusted.RefTime = t
+}
+
+// flushFreshnessLedger performs at most one ledger flush per Refresh call.
+// Flush errors are retained as ledger Warnings but never alter Refresh's
+// original result. Local cache being disabled also disables ledger disk writes.
+func (update *Updater) flushFreshnessLedger() {
+	if update == nil || update.cfg == nil || update.cfg.Freshness == nil || update.cfg.DisableLocalCache {
+		return
+	}
+	_ = update.cfg.Freshness.Flush()
+}
+
+// auditFreshness fingerprints downloaded candidate bytes, derives Stored from
+// the trusted set version change, classifies the original metadata error, and
+// records the verdict. Fingerprint parse failures intentionally produce no
+// Verdict.
+func (update *Updater) auditFreshness(roleName, parentName string, data []byte, beforeVersion int64, updateErr error) {
+	if update == nil || update.cfg == nil || update.cfg.Freshness == nil {
+		return
+	}
+	ledger := update.cfg.Freshness
+	seen, err := freshness.FingerprintFrom(roleName, parentName, data)
+	if err != nil {
+		return
+	}
+	afterVersion := trustedRoleVersion(update.trusted, roleName)
+	stored := freshnessStored(beforeVersion, afterVersion, seen.Version, updateErr)
+	verdict := ledger.Classify(roleName, parentName, seen, stored, update.trusted.RefTime, updateErr)
+
+	// Snapshot meta removals are derived from Prev.Meta/Seen.Meta, never from
+	// parsing metadata error strings. Record one deterministic verdict per
+	// missing entry.
+	if roleName == metadata.SNAPSHOT {
+		if missing := missingFreshnessMetaEntries(verdict.Prev.Meta, verdict.Seen.Meta); len(missing) > 0 {
+			for _, name := range missing {
+				removal := verdict
+				removal.Code = freshness.CodeMetaRemoval
+				removal.Divergent = false
+				removal.Reason = name
+				ledger.Record(removal)
+			}
+			return
+		}
+	}
+
+	ledger.Record(verdict)
+}
+
+// auditCachedTargetsFreshness records the first successful verification of a
+// already-trusted targets role by a different parent. The fingerprint is still
+// extracted through FingerprintFrom, using the trusted role's JSON encoding.
+func (update *Updater) auditCachedTargetsFreshness(roleName, parentName string, roleMD *metadata.Metadata[metadata.TargetsType]) {
+	if update == nil || update.cfg == nil || update.cfg.Freshness == nil || roleMD == nil {
+		return
+	}
+	data, err := roleMD.MarshalJSON()
+	if err != nil {
+		return
+	}
+	version := trustedRoleVersion(update.trusted, roleName)
+	update.auditFreshness(roleName, parentName, data, version, nil)
+}
+
+// recordTimestampFreshness handles the special final-root expiry check that
+// UpdateTimestamp performs before looking at the downloaded timestamp bytes.
+// The rejected subject is therefore the trusted final root, not timestamp.
+func (update *Updater) recordTimestampFreshness(data []byte, beforeTimestampVersion int64, updateErr error) {
+	if update == nil || update.cfg == nil || update.cfg.Freshness == nil {
+		return
+	}
+	var expired *metadata.ErrExpiredMetadata
+	if errors.As(updateErr, &expired) && expired.Msg == "final root.json is expired" {
+		rootMD := update.trusted.Root
+		seen := freshness.Fingerprint{
+			Role:    metadata.ROOT,
+			Parent:  "",
+			Version: rootMD.Signed.Version,
+			Expires: rootMD.Signed.Expires.UTC(),
+		}
+		beforeRootVersion := rootMD.Signed.Version
+		afterRootVersion := trustedRoleVersion(update.trusted, metadata.ROOT)
+		stored := freshnessStored(beforeRootVersion, afterRootVersion, seen.Version, updateErr)
+		verdict := update.cfg.Freshness.Classify(metadata.ROOT, "", seen, stored, update.trusted.RefTime, updateErr)
+		update.cfg.Freshness.Record(verdict)
+		return
+	}
+	update.auditFreshness(metadata.TIMESTAMP, "", data, beforeTimestampVersion, updateErr)
+}
+
+// recordRootTrustReset records the downstream trust reset required after a
+// strictly newer root has been accepted and the ledger has downstream state to
+// reset. Ledger.Record performs the timestamp/snapshot LastSeen clearing.
+func (update *Updater) recordRootTrustReset(beforeVersion int64, updateErr error) {
+	ledger := update.freshnessLedger()
+	if ledger == nil || updateErr != nil || update.trusted == nil || update.trusted.Root == nil {
+		return
+	}
+	afterVersion := update.trusted.Root.Signed.Version
+	if afterVersion <= beforeVersion {
+		return
+	}
+	_, hadTimestamp := ledger.LastSeen(metadata.TIMESTAMP, "")
+	_, hadSnapshot := ledger.LastSeen(metadata.SNAPSHOT, "")
+	if !hadTimestamp && !hadSnapshot {
+		return
+	}
+
+	refTime := update.trusted.RefTime
+	prev := freshness.Fingerprint{Role: metadata.ROOT, Version: beforeVersion}
+	seen := freshness.Fingerprint{
+		Role:    metadata.ROOT,
+		Version: afterVersion,
+		Expires: update.trusted.Root.Signed.Expires.UTC(),
+	}
+	verdict := freshness.Verdict{
+		Code:    freshness.CodeTrustReset,
+		Role:    metadata.ROOT,
+		Parent:  "",
+		Prev:    prev,
+		Seen:    seen,
+		Stored:  true,
+		RefTime: refTime.UTC(),
+		Reason:  fmt.Sprintf("root advanced from version %d to %d; timestamp and snapshot LastSeen reset", beforeVersion, afterVersion),
+	}
+	ledger.Record(verdict)
+}
+
+func (update *Updater) freshnessLedger() *freshness.Ledger {
+	if update == nil || update.cfg == nil {
+		return nil
+	}
+	return update.cfg.Freshness
+}
+
+func trustedRoleVersion(trustedSet *trustedmetadata.TrustedMetadata, roleName string) int64 {
+	if trustedSet == nil {
+		return 0
+	}
+	switch roleName {
+	case metadata.ROOT:
+		if trustedSet.Root != nil {
+			return trustedSet.Root.Signed.Version
+		}
+	case metadata.TIMESTAMP:
+		if trustedSet.Timestamp != nil {
+			return trustedSet.Timestamp.Signed.Version
+		}
+	case metadata.SNAPSHOT:
+		if trustedSet.Snapshot != nil {
+			return trustedSet.Snapshot.Signed.Version
+		}
+	default:
+		if role, ok := trustedSet.Targets[roleName]; ok && role != nil {
+			return role.Signed.Version
+		}
+	}
+	return 0
+}
+
+func freshnessStored(beforeVersion, afterVersion, seenVersion int64, updateErr error) bool {
+	return (afterVersion == seenVersion && beforeVersion != seenVersion) || updateErr == nil
+}
+
+func missingFreshnessMetaEntries(prev, seen []freshness.MetaRef) []string {
+	seenNames := make(map[string]struct{}, len(seen))
+	for _, ref := range seen {
+		seenNames[ref.Role] = struct{}{}
+	}
+	var missing []string
+	for _, ref := range prev {
+		if _, ok := seenNames[ref.Role]; !ok {
+			missing = append(missing, ref.Role)
+		}
+	}
+	slices.Sort(missing)
+	return missing
 }
 
 func IsWindowsPath(path string) bool {
